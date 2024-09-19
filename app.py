@@ -390,7 +390,7 @@ link_label.grid(row=0, column=0, padx=10, pady=5, sticky=tk.NE)
 link_label.bind("<Button-1>", open_link)
 
 # Créditos
-credits_label = ttk.Label(root, text="v1.2 | Desarrollado por @Slaytonw", font=("Helvetica", 8))
+credits_label = ttk.Label(root, text="v1.3 | Desarrollado por @Slaytonw", font=("Helvetica", 8))
 credits_label.grid(row=1, column=0, pady=0, sticky=tk.S)
 
 # Ejecutar la aplicación

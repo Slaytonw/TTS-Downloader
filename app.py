@@ -13,11 +13,56 @@ import threading
 import webbrowser
 import random
 import string
+import magic
 
 # Declarar variables globales
 folder_name = None
 failed_urls = []
 downloaded_files = 0
+
+# Función para obtener la extensión basada en el tipo MIME
+def get_extension_from_mime(mime_type):
+    mime_to_extension = {
+        'image/jpeg': '.jpg',
+        'image/png': '.png',
+        'application/pdf': '.pdf',
+        'text/plain': '.txt',
+        'application/zip': '.zip',
+        'application/vnd.ms-excel': '.xls',
+        'application/msword': '.doc',
+        'application/octet-stream': '.bin',  # Mantén la extensión .bin si es un binario genérico
+        # Agrega más tipos MIME según lo que quieras manejar
+    }
+    return mime_to_extension.get(mime_type, '.bin')  # Si no se reconoce el tipo, deja .bin
+
+# Función para renombrar archivos binarios según su tipo real
+def rename_bin_files(folder_path):
+    # Inicializar la herramienta magic para detectar tipos MIME
+    mime_detector = magic.Magic(mime=True)
+    
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith('.bin'):
+            file_path = os.path.join(folder_path, file_name)
+            
+            # Detectar el tipo MIME del archivo
+            mime_type = mime_detector.from_file(file_path)
+            print(f"Archivo: {file_name}, MIME detectado: {mime_type}")
+            
+            # Obtener la nueva extensión basada en el tipo MIME
+            new_extension = get_extension_from_mime(mime_type)
+            
+            # Renombrar el archivo solo si la extensión cambia
+            if not file_name.endswith(new_extension):
+                new_file_name = os.path.splitext(file_name)[0] + new_extension
+                new_file_path = os.path.join(folder_path, new_file_name)
+                
+                # Renombrar el archivo
+                os.rename(file_path, new_file_path)
+                print(f"Renombrado a: {new_file_name}")
+            else:
+                os.remove(file_path)
+                print(f"No se necesita cambiar la extensión para: {file_name}")
+
 
 # Función para limpiar nombres de carpetas no válidos en Windows
 def clean_folder_name(folder_name):
@@ -188,6 +233,7 @@ def download_files(urls, folder_name, progress_event, retry=False):
         update_progress_bar((index + 1) / total_files * 100)
 
     if not cancel_flag:
+        rename_bin_files(folder_name)
         if failed_urls:
             progress_label.config(text=f"{folder_name}\nDescarga finalizada. {len(failed_urls)} archivos fallidos")
             update_retry_button(len(failed_urls))

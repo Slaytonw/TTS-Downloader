@@ -1,397 +1,414 @@
-import tkinter as tk
-from tkinter import ttk
-from tkinter import Label
-from urllib.parse import urlparse, parse_qs
-import requests
-from urllib.parse import urlparse
-from bs4 import BeautifulSoup
 import os
 import re
-import tempfile
+import sys
+import random
+import string
 import mimetypes
 import threading
 import webbrowser
-import random
-import string
-import magic
+import tkinter as tk
+from tkinter import ttk
+from urllib.parse import urlparse, parse_qs
 
-# Declarar variables globales
+import requests
+
+# --- Constants ---
+REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds
+USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    'AppleWebKit/537.36 (KHTML, like Gecko) '
+    'Chrome/120.0.0.0 Safari/537.36'
+)
+HEADERS = {'User-Agent': USER_AGENT}
+
+# --- Shared state ---
+cancel_event = threading.Event()
 folder_name = None
 failed_urls = []
 downloaded_files = 0
 
-# Función para obtener la extensión basada en el tipo MIME
-def get_extension_from_mime(mime_type):
-    mime_to_extension = {
-        'image/jpeg': '.jpg',
-        'image/png': '.png',
-        'application/pdf': '.pdf',
-        'text/plain': '.txt',
-        'application/zip': '.zip',
-        'application/vnd.ms-excel': '.xls',
-        'application/msword': '.doc',
-        'application/octet-stream': '.bin',  # Mantén la extensión .bin si es un binario genérico
-        # Agrega más tipos MIME según lo que quieras manejar
-    }
-    return mime_to_extension.get(mime_type, '.bin')  # Si no se reconoce el tipo, deja .bin
 
-# Función para renombrar archivos binarios según su tipo real
+# --- App / icon path resolution (works both as .py and Nuitka standalone) ---
+def app_dir():
+    if '__compiled__' in globals() or getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# --- Magic-number sniffing (replaces python-magic / libmagic) ---
+MAGIC_SIGNATURES = [
+    (b'\xff\xd8\xff', '.jpg'),
+    (b'\x89PNG\r\n\x1a\n', '.png'),
+    (b'GIF87a', '.gif'),
+    (b'GIF89a', '.gif'),
+    (b'%PDF', '.pdf'),
+    (b'PK\x03\x04', '.zip'),
+    (b'ID3', '.mp3'),
+    (b'OggS', '.ogg'),
+    (b'BM', '.bmp'),
+    (b'\x00\x00\x01\x00', '.ico'),
+]
+
+
+def detect_extension(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            head = f.read(16)
+    except OSError:
+        return None
+    if head.startswith(b'RIFF') and len(head) >= 12:
+        if head[8:12] == b'WEBP':
+            return '.webp'
+        if head[8:12] == b'WAVE':
+            return '.wav'
+    if len(head) >= 12 and head[4:8] == b'ftyp':
+        return '.mp4'
+    for sig, ext in MAGIC_SIGNATURES:
+        if head.startswith(sig):
+            return ext
+    return None
+
+
 def rename_bin_files(folder_path):
-    # Inicializar la herramienta magic para detectar tipos MIME
-    mime_detector = magic.Magic(mime=True)
-    
     for file_name in os.listdir(folder_path):
-        if file_name.endswith('.bin'):
-            file_path = os.path.join(folder_path, file_name)
-            
-            # Detectar el tipo MIME del archivo
-            mime_type = mime_detector.from_file(file_path)
-            print(f"Archivo: {file_name}, MIME detectado: {mime_type}")
-            
-            # Obtener la nueva extensión basada en el tipo MIME
-            new_extension = get_extension_from_mime(mime_type)
-            
-            # Renombrar el archivo solo si la extensión cambia
-            if not file_name.endswith(new_extension):
-                new_file_name = os.path.splitext(file_name)[0] + new_extension
-                new_file_path = os.path.join(folder_path, new_file_name)
-                
-                # Renombrar el archivo
-                os.rename(file_path, new_file_path)
-                print(f"Renombrado a: {new_file_name}")
-            else:
-                os.remove(file_path)
-                print(f"No se necesita cambiar la extensión para: {file_name}")
+        if not file_name.endswith('.bin'):
+            continue
+        file_path = os.path.join(folder_path, file_name)
+        new_ext = detect_extension(file_path)
+        if not new_ext or new_ext == '.bin':
+            continue
+        new_name = os.path.splitext(file_name)[0] + new_ext
+        try:
+            os.rename(file_path, os.path.join(folder_path, new_name))
+        except OSError:
+            pass
 
 
-# Función para limpiar nombres de carpetas no válidos en Windows
-def clean_folder_name(folder_name):
-    folder_name = folder_name.strip()
-    return re.sub(r'[\\/*?:"<>|]', '_', folder_name)
+# --- Helpers ---
+def clean_folder_name(name):
+    return re.sub(r'[\\/*?:"<>|]', '_', name.strip())
 
-# Función para extraer URLs
-def extract_urls(file_content):
-    url_pattern = re.compile(
-        r'(https?://(?:www\.)?[a-zA-Z0-9./\-_~:?#[\]@!$&\'()*+,;=]+)'
-    )
-    return url_pattern.findall(file_content)
 
-# Función para obtener la extensión del archivo basada en el tipo MIME
-def get_file_extension(mime_type):
+def get_downloads_dir():
+    home = os.path.expanduser('~')
+    for candidate in (
+        os.path.join(home, 'Downloads'),
+        os.path.join(home, 'OneDrive', 'Downloads'),
+        home,
+    ):
+        if os.path.isdir(candidate):
+            return candidate
+    return os.getcwd()
+
+
+def extract_urls(text):
+    pattern = re.compile(r"https?://(?:www\.)?[a-zA-Z0-9./\-_~:?#@!$&'()*+,;=%]+")
+    return [u.rstrip('.,);\'"') for u in pattern.findall(text)]
+
+
+def guess_extension(mime_type):
     return mimetypes.guess_extension(mime_type) or '.bin'
 
-# Función para actualizar la barra de progreso
-def update_progress_bar(value):
-    progress_var.set(value)
-    root.update_idletasks()
 
-# Función para cancelar el proceso de descarga
-def cancel_download():
-    global cancel_flag
-    cancel_flag = True
-    update_progress_bar(0)
-    download_button['state'] = tk.NORMAL
-    cancel_button['state'] = tk.DISABLED
-    retry_button['state'] = tk.DISABLED
-    progress_label.config(text="Descarga cancelada\n")
+def normalize_dropbox(url):
+    if 'dl=0' in url:
+        return url.replace('dl=0', 'dl=1')
+    if 'dl=' not in url:
+        return url + ('&dl=1' if '?' in url else '?dl=1')
+    return url
 
-# Función para reintentar la descarga de archivos
-def retry_download():
-    retry_button['state'] = tk.DISABLED
-    if failed_urls:
-        threading.Thread(target=lambda: download_files(failed_urls, folder_name, threading.Event(), retry=True)).start()
 
-# Función para actualizar el botón de reintentar
+def resolve_imgur(url):
+    if 'i.imgur.com' in url:
+        return url
+    m = re.match(r'https?://(?:www\.)?imgur\.com/([a-zA-Z0-9]+)/?$', url)
+    if m:
+        return f'https://i.imgur.com/{m.group(1)}.jpg'
+    return url
+
+
+# --- Thread-safe UI updates ---
+def ui(fn, *args, **kwargs):
+    root.after(0, lambda: fn(*args, **kwargs))
+
+
+def set_progress(value):
+    ui(progress_var.set, value)
+
+
+def set_status(text):
+    ui(progress_label.config, text=text)
+
+
+def set_buttons(downloading):
+    def apply():
+        download_button['state'] = tk.DISABLED if downloading else tk.NORMAL
+        cancel_button['state'] = tk.NORMAL if downloading else tk.DISABLED
+    root.after(0, apply)
+
+
 def update_retry_button(failed_count):
-    if failed_count == 0:
-        retry_button['text'] = "Reintentar"
-        retry_button['state'] = tk.DISABLED
+    def apply():
+        if failed_count == 0:
+            retry_button['text'] = "Reintentar"
+            retry_button['state'] = tk.DISABLED
+        else:
+            retry_button['text'] = f"Reintentar ({failed_count} archivos)"
+            retry_button['state'] = tk.NORMAL
+    root.after(0, apply)
+
+
+# --- Download primitives ---
+def write_stream_to_file(response, file_path):
+    """Write streamed response to file. Returns False if cancelled mid-download."""
+    with open(file_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            if cancel_event.is_set():
+                return False
+            if chunk:
+                f.write(chunk)
+    return True
+
+
+def download_generic(url, folder):
+    global downloaded_files
+    tmp_url = url.replace('cloud-3.steamusercontent.com', 'steamusercontent-a.akamaihd.net')
+    tmp_url = tmp_url.replace('http://', 'https://')
+    try:
+        response = requests.get(tmp_url, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        failed_urls.append(url)
+        return
+    if response.status_code != 200:
+        if response.status_code != 404:
+            failed_urls.append(url)
+        return
+    mime = response.headers.get('Content-Type', '').split(';')[0].strip()
+    ext = guess_extension(mime)
+    if 'steamusercontent-a.akamaihd.net' in urlparse(tmp_url).netloc:
+        file_name = url.split('/')[-2] + ext
     else:
-        retry_button['text'] = f"Reintentar ({failed_count} archivos)"
-        retry_button['state'] = tk.NORMAL
+        file_name = ''.join(random.choices(string.ascii_letters, k=30)) + ext
+    file_path = os.path.join(folder, file_name)
+    if write_stream_to_file(response, file_path):
+        downloaded_files += 1
+    else:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
-# Función para manejar la descarga de imágenes desde Imgur
-def download_imgur_image(url, folder_name):
+
+def download_imgur(url, folder):
     global downloaded_files
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    resolved = resolve_imgur(url)
     try:
-        response = requests.get(url, headers=headers, stream=True)
-        if response.status_code == 200:
-            # Obtener el nombre del archivo de la URL de Imgur
-            file_name = url.split('/')[-1]
-            file_path = os.path.join(folder_name, file_name)
-
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            print(f"Imagen descargada desde Imgur: {file_path}")
-            downloaded_files += 1
-        else:
-            print(f"Error al descargar la imagen desde Imgur: {response.status_code}")
-            failed_urls.append(url)
-    except Exception as e:
-        print(f"Error al descargar imagen desde Imgur: {e}")
+        response = requests.get(resolved, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
         failed_urls.append(url)
+        return
+    if response.status_code != 200:
+        failed_urls.append(url)
+        return
+    file_name = resolved.split('/')[-1].split('?')[0]
+    file_path = os.path.join(folder, file_name)
+    if write_stream_to_file(response, file_path):
+        downloaded_files += 1
 
-# Función para manejar la descarga de archivos desde Dropbox
-def download_dropbox_file(url, folder_name):
+
+def download_dropbox(url, folder):
     global downloaded_files
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    resolved = normalize_dropbox(url)
     try:
-        response = requests.get(url, headers=headers, stream=True)
-        if response.status_code == 200:
-            # Extraer el nombre del archivo del encabezado 'Content-Disposition'
-            content_disposition = response.headers.get('Content-Disposition', '')
-            file_name_match = re.findall('filename="(.+)"', content_disposition)
-
-            # Si el encabezado tiene un nombre de archivo, usarlo. Si no, usar un nombre por defecto.
-            if file_name_match:
-                file_name = file_name_match[0]
-            else:
-                # Si no se encuentra el nombre, usar el último segmento de la URL
-                file_name = url.split('/')[-1]
-
-            # Asegurarse de que el archivo tenga la extensión correcta
-            file_path = os.path.join(folder_name, file_name)
-
-            # Descargar el archivo y guardarlo
-            with open(file_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            print(f"Archivo descargado desde Dropbox: {file_path}")
-            downloaded_files += 1
-        else:
-            print(f"Error al descargar el archivo desde Dropbox: {response.status_code}")
-            failed_urls.append(url)
-    except Exception as e:
-        print(f"Error al descargar archivo desde Dropbox: {e}")
+        response = requests.get(resolved, headers=HEADERS, stream=True, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
         failed_urls.append(url)
+        return
+    if response.status_code != 200:
+        failed_urls.append(url)
+        return
+    disposition = response.headers.get('Content-Disposition', '')
+    match = re.findall(r'filename="(.+?)"', disposition)
+    file_name = match[0] if match else resolved.split('/')[-1].split('?')[0]
+    file_path = os.path.join(folder, file_name)
+    if write_stream_to_file(response, file_path):
+        downloaded_files += 1
 
-# Función para descargar archivos a partir de una lista de URLs
-def download_files(urls, folder_name, progress_event, retry=False):
-    global cancel_flag, failed_urls, downloaded_files
-    total_files = len(urls)
-    cancel_flag = False
+
+def download_files(urls, folder, retry=False):
+    global failed_urls, downloaded_files
+    cancel_event.clear()
     failed_urls = []
     downloaded_files = 0
-    
-    for index, url in enumerate(urls):
-        if cancel_flag:
-            print("Descarga cancelada.")
-            failed_urls.append(url)
+    total = len(urls)
+    label = os.path.basename(folder) or folder
+
+    for i, url in enumerate(urls):
+        if cancel_event.is_set():
             break
-        
-        # Verificar si es una URL de Imgur
-        parsed_url = urlparse(url)
-        if "dropbox.com" in parsed_url.netloc:
-            # Descargar el archivo desde Dropbox
-            download_dropbox_file(url, folder_name)
-        elif "imgur.com" in parsed_url.netloc:
-            # Descargar la imagen de Imgur
-            download_imgur_image(url, folder_name)
+        netloc = urlparse(url).netloc.lower()
+        if 'dropbox.com' in netloc:
+            download_dropbox(url, folder)
+        elif 'imgur.com' in netloc:
+            download_imgur(url, folder)
         else:
-            tmp_url = url.replace('cloud-3.steamusercontent.com', 'steamusercontent-a.akamaihd.net')
-            tmp_url = tmp_url.replace('http://', 'https://')
+            download_generic(url, folder)
+        set_status(f"{label}\nDescargando {downloaded_files}/{total}")
+        set_progress((i + 1) / total * 100)
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            }
-            try:
-                response = requests.get(tmp_url, headers=headers, stream=True)
-                if response.status_code == 200:
-                    file_extension = get_file_extension(response.headers.get('Content-Type', ''))
-                    if "steamusercontent-a.akamaihd.net" in parsed_url.netloc:
-                        file_name = url.split('/')[-2] + file_extension
-                    else:
-                        file_name = ''.join(random.choices(string.ascii_letters, k=30)) + file_extension
-                    file_path = os.path.join(folder_name, file_name)
-
-                    with open(file_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-
-                    downloaded_files += 1
-                    #print(f"Archivo descargado: {file_path}")
-                else:
-                    if response.status_code != 404:
-                        print(f"Error al descargar el archivo (code {response.status_code}): {tmp_url}")
-                        failed_urls.append(url)
-            except requests.exceptions.SSLError as ssl_error:
-                print(f"Error SSL al descargar {tmp_url}: {ssl_error}")
-                failed_urls.append(url)
-            except Exception as e:
-                print(f"Error al descargar {tmp_url}: {e}")
-                failed_urls.append(url)
-
-        progress_label.config(text=f"{folder_name}\nDescargando {downloaded_files}/{total_files}")
-        update_progress_bar((index + 1) / total_files * 100)
-
-    if not cancel_flag:
-        rename_bin_files(folder_name)
-        if failed_urls:
-            progress_label.config(text=f"{folder_name}\nDescarga finalizada. {len(failed_urls)} archivos fallidos")
-            update_retry_button(len(failed_urls))
-        else:
-            progress_label.config(text=f"{folder_name}\nDescarga finalizada ({downloaded_files}/{total_files})")
-            retry_button['state'] = tk.DISABLED
+    if cancel_event.is_set():
+        set_status("Descarga cancelada\n")
     else:
-        progress_label.config(text="Descarga cancelada\n")
-    
-    progress_event.set()
+        rename_bin_files(folder)
+        if failed_urls:
+            set_status(f"{label}\nDescarga finalizada. {len(failed_urls)} fallidos")
+        else:
+            set_status(f"{label}\nDescarga finalizada ({downloaded_files}/{total})")
+        if downloaded_files > 0:
+            open_in_explorer(folder)
+    update_retry_button(len(failed_urls))
+    set_buttons(downloading=False)
+
 
 def process_download():
     global folder_name
-    url = url_entry.get()
-    download_button['state'] = tk.DISABLED
-    cancel_button['state'] = tk.NORMAL
-    retry_button['state'] = tk.DISABLED
-    
-    parsed_url = urlparse(url)
-    query_params = parse_qs(parsed_url.query)
-    
-    if 'id' in query_params:
-        workshop_id = query_params['id'][0]
-        print(f"Workshop ID: {workshop_id}")
+    url = url_entry.get().strip()
+    set_buttons(downloading=True)
 
-        # URL de la API de Steam Workshop
-        url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
-        print(f"Descargar de: {url}")
+    params = parse_qs(urlparse(url).query)
+    if 'id' not in params:
+        set_status("URL no válida\n")
+        set_buttons(downloading=False)
+        return
+    workshop_id = params['id'][0]
 
-        # Parámetros de la solicitud POST
-        data = {
-            'itemcount': 1,
-            'publishedfileids[0]': workshop_id
-        }
+    api_url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+    try:
+        response = requests.post(
+            api_url,
+            data={'itemcount': 1, 'publishedfileids[0]': workshop_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        details = response.json()['response']['publishedfiledetails'][0]
+    except (requests.RequestException, KeyError, IndexError, ValueError):
+        set_status("Error consultando Workshop\n")
+        set_buttons(downloading=False)
+        return
 
-        # Realizar la solicitud POST
-        try:
-            response = requests.post(url, data=data)
-            response.raise_for_status()
-        except requests.exceptions.RequestException as e:
-            return {'error': f'Error en la solicitud: {e}'}
+    file_url = details.get('file_url')
+    if not file_url:
+        set_status("Workshop sin archivo asociado\n")
+        set_buttons(downloading=False)
+        return
 
-        # Decodificar la respuesta JSON
-        decoded_response = response.json()
-        
-        # Validar la respuesta
-        if 'response' in decoded_response and 'publishedfiledetails' in decoded_response['response']:
-            response = decoded_response['response']['publishedfiledetails'][0]
+    title = details.get('title') or f'workshop_{workshop_id}'
+    folder_name = os.path.join(get_downloads_dir(), clean_folder_name(title))
+    os.makedirs(folder_name, exist_ok=True)
 
-            file_url = response['file_url']
-            folder_name = response['title']
-            folder_name = clean_folder_name(folder_name)
+    try:
+        file_response = requests.get(file_url, timeout=REQUEST_TIMEOUT)
+        file_response.raise_for_status()
+    except requests.RequestException:
+        set_status("Error descargando metadata\n")
+        set_buttons(downloading=False)
+        return
 
-            if not os.path.exists(folder_name):
-                os.makedirs(folder_name)
-                print(f"Carpeta creada: {folder_name}")
+    content = file_response.content.decode('utf-8', errors='ignore')
+    urls = list({u for u in extract_urls(content)})
+    if not urls:
+        set_status("No se encontraron URLs\n")
+        set_buttons(downloading=False)
+        return
 
-            file_response = requests.get(file_url)
-            if file_response.status_code == 200:
-                with tempfile.NamedTemporaryFile(delete=False, mode='wb') as temp_file:
-                    temp_file.write(file_response.content)
-                    temp_file_path = temp_file.name
-                    print(f"Archivo temporal descargado: {temp_file_path}")
+    set_progress(0)
+    download_files(urls, folder_name)
 
-                with open(temp_file_path, 'rb') as file:
-                    file_content = file.read().decode('utf-8', errors='ignore')
 
-                urls = extract_urls(file_content)
-                unique_urls = list(set(urls))
+def cancel_download():
+    cancel_event.set()
 
-                progress_var.set(0)
-                progress_bar['value'] = 0
 
-                progress_event = threading.Event()
-                download_thread = threading.Thread(target=lambda: download_files(unique_urls, folder_name, progress_event))
-                download_thread.start()
-                download_thread.join()
+def retry_download():
+    if failed_urls and folder_name:
+        urls = list(failed_urls)
+        retry_button['state'] = tk.DISABLED
+        set_buttons(downloading=True)
+        threading.Thread(
+            target=lambda: download_files(urls, folder_name, retry=True),
+            daemon=True,
+        ).start()
 
-                os.remove(temp_file_path)
-                print(f"Archivo temporal eliminado: {temp_file_path}")
 
-            else:
-                print(f"Error al descargar el archivo: {file_response.status_code}")
-        else:
-            return {'error': 'Error al obtener los detalles del workshop.'}
-    else:
-        print("No se pudo extraer el ID de la URL.")
-
-    update_retry_button(len(failed_urls))
-    download_button['state'] = tk.NORMAL
-    cancel_button['state'] = tk.DISABLED
-    update_progress_bar(0)
-
-# Función para manejar el clic en el botón de descarga
 def on_download_click():
-    progress_label.config(text="Analizando...\n")
-    threading.Thread(target=process_download).start()
+    set_status("Analizando...\n")
+    threading.Thread(target=process_download, daemon=True).start()
 
-# Función para abrir el enlace en el navegador
-def open_link(event):
+
+def open_link(_event):
     webbrowser.open("https://steamcommunity.com/app/286160/workshop/")
 
-# Crear ventana principal
+
+def open_in_explorer(path):
+    try:
+        os.startfile(path)
+    except OSError:
+        pass
+
+
+# --- UI ---
 root = tk.Tk()
 root.title("TTS Downloader")
-root.geometry("280x250")
+root.geometry("280x275")
 root.eval('tk::PlaceWindow . center')
-root.resizable(False, False)  # Deshabilitar redimensionamiento
+root.resizable(False, False)
 
-# Establecer el icono
-try:
-    root.iconbitmap('icon.ico')
-except Exception as e:
-    print(f"Error al cargar el icono: {e}")
+icon_path = os.path.join(app_dir(), 'icon.ico')
+if os.path.exists(icon_path):
+    try:
+        root.iconbitmap(icon_path)
+    except tk.TclError:
+        pass
 
-# Crear frame para centrar los elementos
 frame = ttk.Frame(root, padding="10 10 10 10")
 frame.grid(column=0, row=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 frame.columnconfigure(0, weight=1)
 frame.rowconfigure(0, weight=1)
 
-# Etiqueta Workshop URL
-url_label = ttk.Label(frame, text="Workshop URL:")
-url_label.grid(column=0, row=0, padx=5, pady=5, sticky=tk.W)
+ttk.Label(frame, text="Workshop URL:").grid(column=0, row=0, padx=5, pady=5, sticky=tk.W)
 
-# Input para URL
 url_entry = ttk.Entry(frame, width=40)
 url_entry.grid(column=0, row=1, columnspan=2, padx=5, pady=5)
 
-# Botón Descargar
+hint_label = ttk.Label(
+    frame,
+    text="Se guardará en tu carpeta Descargas",
+    foreground="gray",
+    font=("Helvetica", 8, "italic"),
+)
+hint_label.grid(column=0, row=2, columnspan=2, padx=5, pady=(0, 5), sticky=tk.W)
+
 download_button = ttk.Button(frame, text="Descargar", command=on_download_click)
-download_button.grid(column=0, row=2, padx=5, pady=5, sticky=tk.W)
+download_button.grid(column=0, row=3, padx=5, pady=5, sticky=tk.W)
 
-# Botón Cancelar
 cancel_button = ttk.Button(frame, text="Cancelar", command=cancel_download, state=tk.DISABLED)
-cancel_button.grid(column=1, row=2, padx=5, pady=5, sticky=tk.E)
+cancel_button.grid(column=1, row=3, padx=5, pady=5, sticky=tk.E)
 
-# Botón Reintentar
 retry_button = ttk.Button(frame, text="Reintentar", command=retry_download, state=tk.DISABLED)
-retry_button.grid(column=0, row=3, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
+retry_button.grid(column=0, row=4, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
 
-# Etiqueta de progreso
 progress_label = ttk.Label(frame, text="\n", width=40)
-progress_label.grid(column=0, row=4, columnspan=2, padx=5, pady=5, sticky=tk.W)
+progress_label.grid(column=0, row=5, columnspan=2, padx=5, pady=5, sticky=tk.W)
 
-# Barra de progreso
 progress_var = tk.DoubleVar()
 progress_bar = ttk.Progressbar(frame, variable=progress_var, maximum=100)
-progress_bar.grid(column=0, row=5, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
+progress_bar.grid(column=0, row=6, columnspan=2, padx=5, pady=5, sticky=(tk.W, tk.E))
 
-# Enlace en la esquina superior derecha
 link_label = tk.Label(root, text="TTS Workshop", fg="blue", cursor="hand2")
 link_label.grid(row=0, column=0, padx=10, pady=5, sticky=tk.NE)
 link_label.bind("<Button-1>", open_link)
 
-# Créditos
-credits_label = ttk.Label(root, text="v1.3 | Desarrollado por @Slaytonw", font=("Helvetica", 8))
+credits_label = ttk.Label(root, text="v1.4 | Desarrollado por @Slaytonw", font=("Helvetica", 8))
 credits_label.grid(row=1, column=0, pady=0, sticky=tk.S)
 
-# Ejecutar la aplicación
 root.mainloop()
